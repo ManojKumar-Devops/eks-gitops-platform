@@ -1,6 +1,6 @@
 # Deployment Guide
 
-Complete step-by-step instructions to deploy the EKS GitOps Platform from scratch. Follow phases in order — each phase depends on the previous one being complete.
+Complete step-by-step instructions to deploy and destroy the EKS GitOps Platform. Follow phases in order — each phase depends on the previous one being complete.
 
 ---
 
@@ -97,14 +97,14 @@ Run once per AWS account:
 ### Step 1 — Create S3 bucket for Terraform state
 
 ```bash
-aws s3 mb s3://eks-platform-tfstate-544949538590 --region ap-south-1
+aws s3 mb s3://eks-platform-tfstate-YOUR_ACCOUNT_ID --region ap-south-1
 ```
 
 ### Step 2 — Enable versioning
 
 ```bash
 aws s3api put-bucket-versioning \
-  --bucket eks-platform-tfstate-544949538590 \
+  --bucket eks-platform-tfstate-YOUR_ACCOUNT_ID \
   --versioning-configuration Status=Enabled
 ```
 
@@ -390,7 +390,6 @@ Create `.github/workflows/ci.yml` and `.github/workflows/cd-dev.yml` as shown in
 ### Step 3 — Test pipeline
 
 ```bash
-# Make a small change
 echo "# test" >> app/README.md
 git add .
 git commit -m "test: trigger CI pipeline"
@@ -445,12 +444,7 @@ kubectl get pods -n monitoring | grep loki
 
 ## Phase 8 — Test End-to-End GitOps Flow
 
-This is the final verification that everything works together:
-
 ```bash
-# Make a meaningful change to the app
-# Edit k8s/base/deployment.yaml — change replicas from 2 to 3
-
 sed -i '' 's/replicas: 2/replicas: 3/' \
   ~/eks-gitops-platform/k8s/base/deployment.yaml
 
@@ -466,44 +460,370 @@ kubectl get applications -n argocd -w
 kubectl get pods -n app-dev -w
 ```
 
-Within 60 seconds ArgoCD will deploy 3 pods — with zero manual intervention.
+Within 60 seconds ArgoCD will deploy 3 pods with zero manual intervention.
 
 ---
 
-## Cleanup — Avoid AWS Charges
+## Phase 9 — Destroy and Cleanup
 
-Run in this exact order:
+> **⚠ Critical: Always destroy in this exact order.** Destroying Terraform before removing Kubernetes resources leaves orphaned ALBs attached to the VPC, which blocks VPC deletion and leaves resources charging your account.
+
+### Destroy order
+
+```
+ArgoCD apps → Helm releases → ArgoCD → IRSA roles → Terraform destroy → AWS resources → State backend
+```
+
+### Step 1 — Delete ArgoCD applications
+
+Removes all Kubernetes workloads ArgoCD manages:
 
 ```bash
-# 1. Delete ArgoCD applications
-kubectl delete application app-dev -n argocd
+kubectl delete application app-dev -n argocd 2>/dev/null || true
+kubectl get pods -n app-dev 2>/dev/null || echo "namespace cleaned up"
+```
 
-# 2. Uninstall Helm releases
-helm uninstall kube-prometheus-stack -n monitoring
-helm uninstall loki -n monitoring
-helm uninstall aws-load-balancer-controller -n kube-system
-helm uninstall cert-manager -n cert-manager
+### Step 2 — Uninstall Helm releases
 
-# 3. Delete ArgoCD
+The Load Balancer Controller must be uninstalled first — it owns the ALB. Removing it deletes the ALB from AWS before Terraform destroys the VPC.
+
+```bash
+helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true
+helm uninstall kube-prometheus-stack -n monitoring 2>/dev/null || true
+helm uninstall loki -n monitoring 2>/dev/null || true
+helm uninstall cert-manager -n cert-manager 2>/dev/null || true
+helm uninstall cluster-autoscaler -n kube-system 2>/dev/null || true
+```
+
+Verify ALB is fully deleted from AWS before proceeding — this is critical:
+
+```bash
+aws elbv2 describe-load-balancers \
+  --region ap-south-1 \
+  --query 'LoadBalancers[?contains(LoadBalancerName, `eks`)].LoadBalancerName' \
+  --output table
+```
+
+Wait until this returns empty. The ALB must be gone before running Terraform destroy.
+
+### Step 3 — Uninstall ArgoCD and delete namespaces
+
+```bash
 kubectl delete -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
+  2>/dev/null || true
 
-# 4. Destroy all Terraform infrastructure
+kubectl delete namespace argocd    2>/dev/null || true
+kubectl delete namespace app-dev   2>/dev/null || true
+kubectl delete namespace monitoring 2>/dev/null || true
+kubectl delete namespace cert-manager 2>/dev/null || true
+```
+
+Verify only system namespaces remain:
+
+```bash
+kubectl get namespaces
+```
+
+Should show only: `default`, `kube-system`, `kube-public`, `kube-node-lease`
+
+### Step 4 — Delete IRSA service accounts
+
+eksctl created IAM roles for EBS CSI and Load Balancer Controller. Delete them before Terraform to avoid IAM conflicts:
+
+```bash
+eksctl delete iamserviceaccount \
+  --name ebs-csi-controller-sa \
+  --namespace kube-system \
+  --cluster eks-platform-dev \
+  --region ap-south-1 2>/dev/null || true
+
+eksctl delete iamserviceaccount \
+  --name aws-load-balancer-controller \
+  --namespace kube-system \
+  --cluster eks-platform-dev \
+  --region ap-south-1 2>/dev/null || true
+```
+
+Verify IAM roles are removed:
+
+```bash
+aws iam list-roles \
+  --query 'Roles[?contains(RoleName, `eks-platform-dev`)].RoleName' \
+  --output table
+```
+
+### Step 5 — Terraform destroy
+
+Destroys the EKS cluster, node groups, VPC, subnets, NAT Gateway, Internet Gateway, security groups, KMS key, and CloudWatch log group:
+
+```bash
 cd ~/eks-gitops-platform/terraform/environments/dev
 terraform destroy -auto-approve
+```
 
-# 5. Delete ECR images
+This takes 15–20 minutes. Resources are destroyed in this order:
+- EKS managed node groups (~5 min)
+- EKS cluster (~3 min)
+- EKS addons (coredns, vpc-cni, kube-proxy, ebs-csi)
+- Security groups
+- Subnets
+- NAT Gateway (~2 min)
+- Internet Gateway
+- VPC
+- IAM roles
+- KMS key + alias
+- CloudWatch log group
+
+Expected final output:
+```
+Destroy complete! Resources: 34 destroyed.
+```
+
+### Step 6 — Delete remaining AWS resources
+
+These are created outside Terraform and must be deleted manually:
+
+```bash
+# Delete ECR repository and all images
 aws ecr batch-delete-image \
   --repository-name eks-platform-app \
   --region ap-south-1 \
   --image-ids imageTag=latest 2>/dev/null || true
 
-# 6. Delete Terraform state resources (optional)
-aws s3 rb s3://eks-platform-tfstate-544949538590 --force
+aws ecr delete-repository \
+  --repository-name eks-platform-app \
+  --force \
+  --region ap-south-1 2>/dev/null || true
+
+# Delete GitHub token secret
+aws secretsmanager delete-secret \
+  --secret-id github-token \
+  --force-delete-without-recovery \
+  --region ap-south-1 2>/dev/null || true
+
+# Delete CloudWatch log group if it remains
+aws logs delete-log-group \
+  --log-group-name /aws/eks/eks-platform-dev/cluster \
+  --region ap-south-1 2>/dev/null || true
+
+# Delete KMS alias if it remains
+aws kms delete-alias \
+  --alias-name alias/eks/eks-platform-dev \
+  --region ap-south-1 2>/dev/null || true
+```
+
+### Step 7 — Handle leftover VPC resources (if Terraform missed them)
+
+If Terraform destroy left a VPC or NAT Gateway, clean them up manually:
+
+```bash
+# Check for leftover resources
+aws ec2 describe-vpcs \
+  --filters "Name=tag:Name,Values=*eks*" \
+  --region ap-south-1 \
+  --query 'Vpcs[*].{VpcId:VpcId,Name:Tags[?Key==`Name`].Value|[0]}'
+
+aws ec2 describe-nat-gateways \
+  --filter "Name=state,Values=available" \
+  --region ap-south-1 \
+  --query 'NatGateways[*].{Id:NatGatewayId,VPC:VpcId}'
+```
+
+If resources exist, delete in this order:
+
+```bash
+# 1. Delete NAT Gateway
+aws ec2 delete-nat-gateway \
+  --nat-gateway-id nat-XXXXXXXXXXXXXXXXX \
+  --region ap-south-1
+
+aws ec2 wait nat-gateway-deleted \
+  --nat-gateway-ids nat-XXXXXXXXXXXXXXXXX \
+  --region ap-south-1 && echo "NAT Gateway deleted"
+
+# 2. Release Elastic IP
+ALLOC_ID=$(aws ec2 describe-addresses \
+  --region ap-south-1 \
+  --query 'Addresses[?AssociationId==null].AllocationId' \
+  --output text)
+aws ec2 release-address --allocation-id $ALLOC_ID --region ap-south-1
+
+# 3. Delete subnets
+for subnet in $(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=vpc-XXXXXXXXXXXXXXXXX" \
+  --region ap-south-1 \
+  --query 'Subnets[*].SubnetId' --output text); do
+  aws ec2 delete-subnet --subnet-id $subnet --region ap-south-1
+done
+
+# 4. Detach and delete Internet Gateway
+IGW=$(aws ec2 describe-internet-gateways \
+  --filters "Name=attachment.vpc-id,Values=vpc-XXXXXXXXXXXXXXXXX" \
+  --region ap-south-1 \
+  --query 'InternetGateways[0].InternetGatewayId' --output text)
+aws ec2 detach-internet-gateway \
+  --internet-gateway-id $IGW \
+  --vpc-id vpc-XXXXXXXXXXXXXXXXX --region ap-south-1
+aws ec2 delete-internet-gateway \
+  --internet-gateway-id $IGW --region ap-south-1
+
+# 5. Remove security group rules (handles cross-reference dependency)
+for sg in $(aws ec2 describe-security-groups \
+  --filters "Name=vpc-id,Values=vpc-XXXXXXXXXXXXXXXXX" \
+  --region ap-south-1 \
+  --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+  --output text); do
+  aws ec2 revoke-security-group-ingress --group-id $sg \
+    --ip-permissions "$(aws ec2 describe-security-groups \
+      --group-ids $sg --region ap-south-1 \
+      --query 'SecurityGroups[0].IpPermissions' --output json)" \
+    --region ap-south-1 2>/dev/null || true
+  aws ec2 revoke-security-group-egress --group-id $sg \
+    --ip-permissions "$(aws ec2 describe-security-groups \
+      --group-ids $sg --region ap-south-1 \
+      --query 'SecurityGroups[0].IpPermissionsEgress' --output json)" \
+    --region ap-south-1 2>/dev/null || true
+  aws ec2 delete-security-group --group-id $sg --region ap-south-1
+done
+
+# 6. Delete route tables (non-main)
+for rt in $(aws ec2 describe-route-tables \
+  --filters "Name=vpc-id,Values=vpc-XXXXXXXXXXXXXXXXX" \
+  --region ap-south-1 \
+  --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' \
+  --output text); do
+  aws ec2 delete-route-table --route-table-id $rt --region ap-south-1
+done
+
+# 7. Finally delete the VPC
+aws ec2 delete-vpc \
+  --vpc-id vpc-XXXXXXXXXXXXXXXXX \
+  --region ap-south-1 && echo "VPC deleted"
+```
+
+### Step 8 — Delete Terraform state backend
+
+> Skip this step if you plan to redeploy later. The S3 bucket and DynamoDB table cost less than ₹1/month and can be reused.
+
+```bash
+# Delete all versioned objects in S3 (versioning prevents simple deletion)
+aws s3api delete-objects \
+  --bucket eks-platform-tfstate-YOUR_ACCOUNT_ID \
+  --delete "$(aws s3api list-object-versions \
+    --bucket eks-platform-tfstate-YOUR_ACCOUNT_ID \
+    --region ap-south-1 \
+    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+    --output json)" \
+  --region ap-south-1 2>/dev/null || true
+
+# Delete all delete markers
+aws s3api delete-objects \
+  --bucket eks-platform-tfstate-YOUR_ACCOUNT_ID \
+  --delete "$(aws s3api list-object-versions \
+    --bucket eks-platform-tfstate-YOUR_ACCOUNT_ID \
+    --region ap-south-1 \
+    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+    --output json)" \
+  --region ap-south-1 2>/dev/null || true
+
+# Now delete the bucket
+aws s3 rb \
+  s3://eks-platform-tfstate-YOUR_ACCOUNT_ID \
+  --region ap-south-1
+
+# Delete DynamoDB lock table
 aws dynamodb delete-table \
   --table-name terraform-state-lock \
   --region ap-south-1
 ```
+
+### Step 9 — Clean up local kubeconfig
+
+```bash
+kubectl config delete-context \
+  arn:aws:eks:ap-south-1:YOUR_ACCOUNT_ID:cluster/eks-platform-dev \
+  2>/dev/null || true
+
+kubectl config delete-cluster \
+  arn:aws:eks:ap-south-1:YOUR_ACCOUNT_ID:cluster/eks-platform-dev \
+  2>/dev/null || true
+
+kubectl config get-contexts
+```
+
+`eks-platform-dev` should no longer appear.
+
+### Step 10 — Final verification — confirm zero AWS charges
+
+Run this full check — every section must return empty:
+
+```bash
+echo "=== EKS clusters ===" && \
+aws eks list-clusters --region ap-south-1
+
+echo "=== VPCs ===" && \
+aws ec2 describe-vpcs \
+  --filters "Name=tag:Name,Values=*eks*" \
+  --region ap-south-1 \
+  --query 'Vpcs[*].VpcId'
+
+echo "=== NAT Gateways ===" && \
+aws ec2 describe-nat-gateways \
+  --filter "Name=state,Values=available" \
+  --region ap-south-1 \
+  --query 'NatGateways[*].NatGatewayId'
+
+echo "=== Load Balancers ===" && \
+aws elbv2 describe-load-balancers \
+  --region ap-south-1 \
+  --query 'LoadBalancers[?contains(LoadBalancerName,`eks`)].LoadBalancerName'
+
+echo "=== Elastic IPs ===" && \
+aws ec2 describe-addresses \
+  --region ap-south-1 \
+  --query 'Addresses[*].PublicIp'
+
+echo "=== ECR repos ===" && \
+aws ecr describe-repositories \
+  --region ap-south-1 \
+  --query 'repositories[*].repositoryName' 2>/dev/null || echo "none"
+
+echo "=== S3 state bucket ===" && \
+aws s3 ls | grep eks-platform || echo "deleted"
+
+echo "=== DynamoDB ===" && \
+aws dynamodb list-tables \
+  --region ap-south-1 \
+  --query 'TableNames[?contains(@, `terraform`)]'
+```
+
+All sections returning `[]` or empty confirms your AWS account is completely clean with zero ongoing charges.
+
+### Resources destroyed — complete list
+
+| Resource | Destroyed by |
+|----------|-------------|
+| ArgoCD applications | `kubectl delete application` |
+| App pods + services | ArgoCD cleanup |
+| Helm releases (ALB, Prometheus, Loki, Cert-Manager) | `helm uninstall` |
+| IRSA IAM roles (EBS CSI, ALB Controller) | `eksctl delete iamserviceaccount` |
+| EKS managed node groups | `terraform destroy` |
+| EKS cluster | `terraform destroy` |
+| EKS addons | `terraform destroy` |
+| VPC + all subnets | `terraform destroy` / manual |
+| NAT Gateway | `terraform destroy` / manual |
+| Internet Gateway | `terraform destroy` / manual |
+| Route tables | `terraform destroy` / manual |
+| Security groups | `terraform destroy` / manual |
+| KMS key + alias | `terraform destroy` / manual |
+| CloudWatch log group | `terraform destroy` / manual |
+| Elastic IP | manual |
+| ECR repository | manual |
+| Secrets Manager secret | manual |
+| S3 Terraform state bucket | manual |
+| DynamoDB lock table | manual |
+| Local kubeconfig context | manual |
 
 ---
 
@@ -519,9 +839,12 @@ aws dynamodb delete-table \
 | `ArgoCD applicationset-controller crash` | CRD annotation too large | Remove `last-applied-configuration` annotation from CRD, restart controller |
 | `localhost refused to connect` | Port-forward stopped | Re-run `kubectl port-forward svc/argocd-server -n argocd 8080:443 &` |
 | `UnauthorizedOperation ec2:DescribeAvailabilityZones` | Node IAM role lacks EBS permissions | Create IRSA service account with `AmazonEBSCSIDriverPolicy` |
+| `BucketNotEmpty` on S3 delete | Versioned bucket has version history | Delete all versions and delete markers first, then remove bucket |
+| `DependencyViolation` on security group delete | SGs reference each other in rules | Revoke all ingress/egress rules from both SGs first, then delete |
+| `VPC has dependent objects` | Subnets, IGW, or route tables still exist | Delete in order: NAT GW → Elastic IP → subnets → IGW → route tables → security groups → VPC |
 
 ---
 
 ## Author
 
-**ManojKumar-Devops** · [github.com/ManojKumar-Devops](https://github.com/ManojKumar-Devops)
+**Manojkumar** · [github.com/ManojKumar-Devops](https://github.com/ManojKumar-Devops)
