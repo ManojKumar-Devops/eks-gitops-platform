@@ -1,15 +1,15 @@
-# Terraform
+# Terraform — never commit these
 **/.terraform/
+**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.backup
-*.tfvars
-.terraform.lock.hcl
+*.tfplan
 tfplan
 
 # Mac
 .DS_Store
 
-# Sensitive files
+# Sensitive
 *.pem
 *.key
 kubeconfig
